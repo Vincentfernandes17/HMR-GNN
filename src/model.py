@@ -49,8 +49,19 @@ class HeterophilyRelationalLayer(nn.Module):
         self.gate_rel = nn.Linear(rel_dim, hidden_dim, bias=False)
         self.gate_hom = nn.Linear(1, hidden_dim, bias=False) if use_homophily_gate else None
         self.gate_out = nn.Linear(hidden_dim, 1)
+        # Open-gate initialization: start gates near 1 (pass-through) so the model
+        # begins as a strong relational GNN and only learns to *suppress* edges if it
+        # helps. A zero-initialized gate would output 0.5 and halve every message,
+        # handicapping early optimization.
+        self.gate_open_bias = 3.0  # sigmoid(3) ~= 0.95
+        nn.init.constant_(self.gate_out.bias, self.gate_open_bias)
 
         self.rel_attn = nn.Linear(hidden_dim, self.num_heads)
+        # Explicit bidirectional combine. When directions are separated we pool
+        # relations *within* each direction and then fuse the incoming and outgoing
+        # node representations with a learned projection, rather than mixing both
+        # directions through a single softmax (which dilutes directional signal).
+        self.dir_combine = nn.Linear(hidden_dim * 2, hidden_dim) if separate_directions else None
         self.skip = nn.Linear(hidden_dim, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
@@ -81,6 +92,13 @@ class HeterophilyRelationalLayer(nn.Module):
             "gate_max": float(detached.max().item()),
         })
 
+    def _relation_pool(self, rel_stack):
+        # rel_stack: [N, R, H]. Attention-weighted pool over the relation axis.
+        attn_logits = self.rel_attn(rel_stack)                 # [N, R, heads]
+        attn = torch.softmax(attn_logits, dim=1).unsqueeze(-1) # [N, R, heads, 1]
+        rel_stack_heads = rel_stack.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        return (rel_stack_heads * attn).sum(dim=1).mean(dim=1)  # [N, H]
+
     def forward(self, x, edge_index, edge_type, edge_weight=None, relation_homophily=None):
         src, dst = edge_index
         num_nodes = x.size(0)
@@ -96,7 +114,8 @@ class HeterophilyRelationalLayer(nn.Module):
         else:
             relation_homophily = relation_homophily.to(device=device, dtype=x.dtype)
 
-        relation_outputs = []
+        in_relation_outputs = []
+        out_relation_outputs = []
 
         for r in range(self.num_relations):
             mask = edge_type == r
@@ -129,17 +148,22 @@ class HeterophilyRelationalLayer(nn.Module):
                     deg_rev = torch.bincount(s, minlength=num_nodes).clamp(min=1).to(device=device, dtype=x.dtype)
                     out_rev_r = out_rev_r / deg_rev.unsqueeze(-1)
 
-            relation_outputs.append(out_r)
+            in_relation_outputs.append(out_r)
             if self.separate_directions:
-                relation_outputs.append(out_rev_r)
+                out_relation_outputs.append(out_rev_r)
 
-        rel_stack = torch.stack(relation_outputs, dim=1)       # [N, R, H]
-        attn_logits = self.rel_attn(rel_stack)                 # [N, R, heads]
-        attn = torch.softmax(attn_logits, dim=1).unsqueeze(-1) # [N, R, heads, 1]
+        # Pool relations within the incoming direction.
+        in_pooled = self._relation_pool(torch.stack(in_relation_outputs, dim=1))  # [N, H]
 
-        rel_stack_heads = rel_stack.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
-        out = (rel_stack_heads * attn).sum(dim=1).mean(dim=1)
-        out = out + self.skip(x)
+        if self.separate_directions:
+            # Pool relations within the outgoing direction, then fuse both
+            # directions with a learned projection (generalizes directional RGCN).
+            out_pooled = self._relation_pool(torch.stack(out_relation_outputs, dim=1))
+            combined = self.dir_combine(torch.cat([in_pooled, out_pooled], dim=-1))
+        else:
+            combined = in_pooled
+
+        out = combined + self.skip(x)
         out = self.norm(out)
         out = F.relu(out)
         out = F.dropout(out, p=self.dropout, training=self.training)
