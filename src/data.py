@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -63,9 +63,21 @@ def load_mgtab(data_dir: str) -> GraphData:
     )
 
 def remap_labels(y: torch.Tensor) -> torch.Tensor:
+    remapped, _ = remap_labels_with_mapping(y)
+    return remapped
+
+def remap_labels_with_mapping(y: torch.Tensor) -> Tuple[torch.Tensor, Dict[int, int]]:
     uniq = sorted(torch.unique(y).cpu().tolist())
     mapping = {int(v): i for i, v in enumerate(uniq)}
-    return torch.tensor([mapping[int(v)] for v in y.cpu().tolist()], dtype=torch.long)
+    remapped = torch.tensor([mapping[int(v)] for v in y.cpu().tolist()], dtype=torch.long)
+    return remapped, mapping
+
+def select_task_labels(data: GraphData, task: str) -> Tuple[torch.Tensor, Dict[int, int]]:
+    if task == "bot":
+        return remap_labels_with_mapping(data.y_bot)
+    if task == "stance":
+        return remap_labels_with_mapping(data.y_stance)
+    raise ValueError(f"Unsupported task '{task}'. Expected 'bot' or 'stance'.")
 
 def make_splits(y: torch.Tensor, seed: int, train_ratio: float, val_ratio: float) -> Dict[str, torch.Tensor]:
     idx = np.arange(len(y))
@@ -96,3 +108,29 @@ def make_splits(y: torch.Tensor, seed: int, train_ratio: float, val_ratio: float
         "val_mask": to_mask(val_idx),
         "test_mask": to_mask(test_idx),
     }
+
+def relation_homophily(
+    edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
+    labels: torch.Tensor,
+    num_relations: int,
+) -> torch.Tensor:
+    """Return same-label edge ratio per relation for homophily-aware gating."""
+    src, dst = edge_index.cpu()
+    edge_type_cpu = edge_type.cpu().view(-1)
+    labels_cpu = labels.cpu().view(-1)
+    scores = torch.zeros(num_relations, dtype=torch.float)
+
+    for rel in range(num_relations):
+        mask = edge_type_cpu == rel
+        if not mask.any():
+            scores[rel] = 0.5
+            continue
+        same = labels_cpu[src[mask]] == labels_cpu[dst[mask]]
+        scores[rel] = same.float().mean()
+
+    return scores
+
+def label_distribution(y: torch.Tensor) -> Dict[int, int]:
+    values, counts = torch.unique(y.cpu(), return_counts=True)
+    return {int(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}

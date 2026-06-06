@@ -3,44 +3,105 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class HeterophilyRelationalLayer(nn.Module):
-    def __init__(self, hidden_dim: int, num_relations: int, rel_dim: int = 32, dropout: float = 0.3):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_relations: int,
+        rel_dim: int = 32,
+        dropout: float = 0.3,
+        num_heads: int = 1,
+        gate_temperature: float = 1.0,
+        use_homophily_gate: bool = False,
+        homophily_alpha: float = 1.0,
+        separate_directions: bool = False,
+        log_gate_scores: bool = False,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_relations = num_relations
         self.dropout = dropout
+        self.num_heads = max(1, num_heads)
+        self.gate_temperature = max(gate_temperature, 1e-6)
+        self.use_homophily_gate = use_homophily_gate
+        self.homophily_alpha = homophily_alpha
+        self.separate_directions = separate_directions
+        self.log_gate_scores = log_gate_scores
+        self.last_gate_stats = []
 
         self.rel_linears = nn.ModuleList([
+            nn.Linear(hidden_dim, hidden_dim, bias=False)
+            for _ in range(num_relations)
+        ])
+        self.rel_linears_out = nn.ModuleList([
             nn.Linear(hidden_dim, hidden_dim, bias=False)
             for _ in range(num_relations)
         ])
 
         self.rel_emb = nn.Embedding(num_relations, rel_dim)
 
+        gate_in_dim = hidden_dim * 2 + rel_dim + (1 if use_homophily_gate else 0)
         self.gate_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + rel_dim, hidden_dim),
+            nn.Linear(gate_in_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-        self.rel_attn = nn.Linear(hidden_dim, 1)
+        self.rel_attn = nn.Linear(hidden_dim, self.num_heads)
         self.skip = nn.Linear(hidden_dim, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x, edge_index, edge_type, edge_weight=None):
+    def _gate(self, h_source, h_target, rel_vec, homophily_value):
+        parts = [h_source, h_target, rel_vec]
+        if self.use_homophily_gate:
+            hom = torch.full(
+                (h_source.size(0), 1),
+                float(homophily_value),
+                device=h_source.device,
+                dtype=h_source.dtype,
+            )
+            parts.append(hom)
+
+        gate_logits = self.gate_mlp(torch.cat(parts, dim=-1))
+        if self.use_homophily_gate:
+            heterophily_bonus = self.homophily_alpha * (1.0 - float(homophily_value))
+            gate_logits = gate_logits + heterophily_bonus
+        return torch.sigmoid(gate_logits / self.gate_temperature)
+
+    def _collect_gate_stats(self, layer_relation, direction, gate):
+        if not self.log_gate_scores or gate.numel() == 0:
+            return
+        detached = gate.detach().float().cpu().view(-1)
+        self.last_gate_stats.append({
+            "relation": int(layer_relation),
+            "direction": direction,
+            "count": int(detached.numel()),
+            "gate_mean": float(detached.mean().item()),
+            "gate_std": float(detached.std(unbiased=False).item()) if detached.numel() > 1 else 0.0,
+            "gate_min": float(detached.min().item()),
+            "gate_max": float(detached.max().item()),
+        })
+
+    def forward(self, x, edge_index, edge_type, edge_weight=None, relation_homophily=None):
         src, dst = edge_index
         num_nodes = x.size(0)
         device = x.device
+        self.last_gate_stats = []
 
         if edge_weight is None:
             edge_weight = torch.ones(edge_type.size(0), device=device, dtype=x.dtype)
         else:
             edge_weight = edge_weight.to(device=device, dtype=x.dtype)
+        if relation_homophily is None:
+            relation_homophily = torch.full((self.num_relations,), 0.5, device=device, dtype=x.dtype)
+        else:
+            relation_homophily = relation_homophily.to(device=device, dtype=x.dtype)
 
         relation_outputs = []
 
         for r in range(self.num_relations):
             mask = edge_type == r
             out_r = torch.zeros(num_nodes, self.hidden_dim, device=device, dtype=x.dtype)
+            out_rev_r = torch.zeros(num_nodes, self.hidden_dim, device=device, dtype=x.dtype)
 
             if mask.any():
                 s = src[mask]
@@ -50,8 +111,8 @@ class HeterophilyRelationalLayer(nn.Module):
                 h_d = x[d]
                 rel_vec = self.rel_emb.weight[r].unsqueeze(0).expand(h_s.size(0), -1)
 
-                gate_input = torch.cat([h_s, h_d, rel_vec], dim=-1)
-                gate = torch.sigmoid(self.gate_mlp(gate_input))
+                gate = self._gate(h_s, h_d, rel_vec, relation_homophily[r])
+                self._collect_gate_stats(r, "in", gate)
 
                 msg = self.rel_linears[r](h_s) * gate * edge_weight[mask].unsqueeze(-1)
                 out_r.index_add_(0, d, msg)
@@ -59,13 +120,25 @@ class HeterophilyRelationalLayer(nn.Module):
                 deg = torch.bincount(d, minlength=num_nodes).clamp(min=1).to(device=device, dtype=x.dtype)
                 out_r = out_r / deg.unsqueeze(-1)
 
+                if self.separate_directions:
+                    gate_rev = self._gate(h_d, h_s, rel_vec, relation_homophily[r])
+                    self._collect_gate_stats(r, "out", gate_rev)
+                    msg_rev = self.rel_linears_out[r](h_d) * gate_rev * edge_weight[mask].unsqueeze(-1)
+                    out_rev_r.index_add_(0, s, msg_rev)
+
+                    deg_rev = torch.bincount(s, minlength=num_nodes).clamp(min=1).to(device=device, dtype=x.dtype)
+                    out_rev_r = out_rev_r / deg_rev.unsqueeze(-1)
+
             relation_outputs.append(out_r)
+            if self.separate_directions:
+                relation_outputs.append(out_rev_r)
 
         rel_stack = torch.stack(relation_outputs, dim=1)       # [N, R, H]
-        attn_logits = self.rel_attn(rel_stack).squeeze(-1)     # [N, R]
-        attn = torch.softmax(attn_logits, dim=1).unsqueeze(-1) # [N, R, 1]
+        attn_logits = self.rel_attn(rel_stack)                 # [N, R, heads]
+        attn = torch.softmax(attn_logits, dim=1).unsqueeze(-1) # [N, R, heads, 1]
 
-        out = (rel_stack * attn).sum(dim=1)
+        rel_stack_heads = rel_stack.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        out = (rel_stack_heads * attn).sum(dim=1).mean(dim=1)
         out = out + self.skip(x)
         out = self.norm(out)
         out = F.relu(out)
@@ -83,8 +156,15 @@ class HMRGNN(nn.Module):
         num_layers: int = 2,
         rel_dim: int = 32,
         dropout: float = 0.3,
+        num_heads: int = 1,
+        gate_temperature: float = 1.0,
+        use_homophily_gate: bool = False,
+        homophily_alpha: float = 1.0,
+        separate_directions: bool = False,
+        log_gate_scores: bool = False,
     ):
         super().__init__()
+        self.log_gate_scores = log_gate_scores
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -97,6 +177,12 @@ class HMRGNN(nn.Module):
                 num_relations=num_relations,
                 rel_dim=rel_dim,
                 dropout=dropout,
+                num_heads=num_heads,
+                gate_temperature=gate_temperature,
+                use_homophily_gate=use_homophily_gate,
+                homophily_alpha=homophily_alpha,
+                separate_directions=separate_directions,
+                log_gate_scores=log_gate_scores,
             )
             for _ in range(num_layers)
         ])
@@ -108,8 +194,17 @@ class HMRGNN(nn.Module):
             nn.Linear(hidden_dim, num_classes),
         )
 
-    def forward(self, x, edge_index, edge_type, edge_weight=None):
+    def forward(self, x, edge_index, edge_type, edge_weight=None, relation_homophily=None):
         h = self.input_proj(x)
         for layer in self.layers:
-            h = layer(h, edge_index, edge_type, edge_weight)
+            h = layer(h, edge_index, edge_type, edge_weight, relation_homophily)
         return self.classifier(h)
+
+    def gate_statistics(self):
+        stats = []
+        for layer_idx, layer in enumerate(self.layers):
+            for item in layer.last_gate_stats:
+                row = dict(item)
+                row["layer"] = layer_idx
+                stats.append(row)
+        return stats
