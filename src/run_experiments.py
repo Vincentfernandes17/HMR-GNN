@@ -15,6 +15,10 @@ from train import train
 
 BASELINE_MODELS = ["mlp", "gcn", "graphsage", "gat", "rgcn", "dir_rgcn", "hmr", "hmr_full"]
 ABLATION_MODELS = ["hmr", "hmr_homophily", "hmr_directional", "hmr_full"]
+# Models compared under adversarial edge injection: a graph-agnostic control (mlp),
+# the two strongest ungated relational baselines, and the proposed gated model.
+ATTACK_MODELS = ["mlp", "rgcn", "dir_rgcn", "hmr_full"]
+ATTACK_FRACTIONS = [0.0, 0.05, 0.10, 0.20]
 METRIC_KEYS = [
     "accuracy",
     "precision_macro",
@@ -153,6 +157,99 @@ def run_ablation(cfg, seeds, output_dir, verbose):
     return rows, results
 
 
+def _aggregate_attack(rows):
+    groups = {}
+    for row in rows:
+        key = (row["model"], row["attack_fraction"])
+        groups.setdefault(key, []).append(row)
+    out = []
+    for (model, frac), grp in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        entry = {"model": model, "attack_fraction": frac, "runs": len(grp)}
+        for key in ("accuracy", "f1_macro"):
+            mean, std = mean_std([r.get(key) for r in grp])
+            entry[f"{key}_mean"] = mean
+            entry[f"{key}_std"] = std
+        out.append(entry)
+    return out
+
+
+def _attack_degradation(agg):
+    by_model = {}
+    fractions = sorted({r["attack_fraction"] for r in agg})
+    for row in agg:
+        by_model.setdefault(row["model"], {})[row["attack_fraction"]] = row["f1_macro_mean"]
+
+    rows = []
+    max_frac = max(fractions) if fractions else 0.0
+    for model, fmap in by_model.items():
+        row = {"model": model}
+        for frac in fractions:
+            row[f"f1_at_{int(round(frac * 100))}pct"] = fmap.get(frac)
+        base = fmap.get(0.0)
+        attacked = fmap.get(max_frac)
+        if base is not None and attacked is not None:
+            row["abs_drop"] = base - attacked
+            row["rel_drop_pct"] = 100.0 * (base - attacked) / base if base else float("nan")
+        rows.append(row)
+    # Most robust models (smallest relative drop) first.
+    rows.sort(key=lambda r: r.get("rel_drop_pct", float("inf")))
+    return rows
+
+
+def run_attack(cfg, seeds, fractions, output_dir, verbose):
+    rows = []
+    results = []
+    for frac in fractions:
+        for model_name in ATTACK_MODELS:
+            for seed in seeds:
+                run_cfg = deepcopy(cfg)
+                run_cfg.seed = seed
+                run_cfg.attack_fraction = frac
+                run_cfg.output_dir = output_dir
+                print(f"\n=== ATTACK {int(round(frac * 100))}% | {model_name.upper()} | seed={seed} ===")
+                try:
+                    result = train(
+                        run_cfg,
+                        model_name=model_name,
+                        return_metrics=True,
+                        save_outputs=False,
+                        verbose=verbose,
+                    )
+                except RuntimeError as exc:
+                    if "out of memory" in str(exc).lower():
+                        print(f"[skip] OOM: {model_name} frac={frac} seed={seed}")
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    raise
+                row = _metric_row(result)
+                row["attack_fraction"] = frac
+                rows.append(row)
+                results.append(result)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    table_dir = ensure_dir(os.path.join(output_dir, cfg.task, "tables"))
+    agg = _aggregate_attack(rows)
+    write_table_bundle(
+        os.path.join(table_dir, "attack_robustness"),
+        agg,
+        "Robustness under adversarial relation-camouflage edge injection "
+        "(accuracy and macro F1, mean over seeds, by attack intensity)",
+        "tab:attack-robustness",
+    )
+    write_table_bundle(
+        os.path.join(table_dir, "attack_degradation"),
+        _attack_degradation(agg),
+        "Macro F1 degradation under adversarial edge injection relative to the clean "
+        "graph; smaller relative drop indicates greater robustness",
+        "tab:attack-degradation",
+    )
+    return rows, results
+
+
 def _sample_search_space(cfg):
     keys = list(SEARCH_SPACE.keys())
     all_trials = [dict(zip(keys, values)) for values in itertools.product(*(SEARCH_SPACE[k] for k in keys))]
@@ -244,6 +341,11 @@ def _run_task(args, task):
     task_results = []
     task_rows = []
 
+    if args.mode == "attack":
+        fractions = [float(x) for x in args.attack_fractions.split(",") if x.strip()] or ATTACK_FRACTIONS
+        rows, results = run_attack(cfg, seeds, fractions, args.output_dir, verbose)
+        return rows, results
+
     if args.mode == "smoke":
         cfg.epochs = min(cfg.epochs, 2)
         cfg.patience = min(cfg.patience, 2)
@@ -329,7 +431,7 @@ def _export_master_tables(all_rows, all_results, output_dir):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Publication-ready MGTAB experiment runner.")
-    parser.add_argument("--mode", choices=["smoke", "baselines", "tune", "ablation", "all"], default="all")
+    parser.add_argument("--mode", choices=["smoke", "baselines", "tune", "ablation", "attack", "all"], default="all")
     parser.add_argument("--task", choices=["bot", "stance", "both"], default="both")
     parser.add_argument("--data-dir", default="./data/MGTAB")
     parser.add_argument("--output-dir", default="./results")
@@ -337,6 +439,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--trials", type=int, default=12)
+    parser.add_argument("--attack-fractions", default="0.0,0.05,0.10,0.20")
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 

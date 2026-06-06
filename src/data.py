@@ -131,6 +131,78 @@ def relation_homophily(
 
     return scores
 
+def apply_edge_attack(
+    data: GraphData,
+    labels: torch.Tensor,
+    fraction: float,
+    seed: int,
+    target_relations=None,
+) -> GraphData:
+    """Simulate relation camouflage by injecting cross-class (fake<->genuine) edges.
+
+    Adversaries deliberately connect fake accounts to genuine users so that
+    neighborhood aggregation mixes the two classes. We add `fraction * |E|` extra
+    directed edges, each linking two nodes of *different* classes, with relation
+    types drawn from `target_relations` (default: all relations). Node features,
+    labels, and splits are untouched; only the graph structure is perturbed.
+    """
+    if not fraction or fraction <= 0:
+        return data
+
+    edge_index = data.edge_index
+    edge_type = data.edge_type
+    edge_weight = data.edge_weight
+    num_edges = edge_index.size(1)
+    n_inject = int(round(float(fraction) * num_edges))
+    if n_inject <= 0:
+        return data
+
+    generator = torch.Generator().manual_seed(int(seed))
+    labels = labels.view(-1)
+    num_nodes = labels.size(0)
+    num_relations = int(edge_type.max().item()) + 1
+    if target_relations is None:
+        target_relations = list(range(num_relations))
+    target_relations = torch.tensor(target_relations, dtype=torch.long)
+
+    # Sample cross-class node pairs by oversampling and rejecting same-class draws.
+    collected_u, collected_v = [], []
+    remaining = n_inject
+    attempts = 0
+    while remaining > 0 and attempts < 200:
+        batch = max(remaining * 2, 1024)
+        u = torch.randint(num_nodes, (batch,), generator=generator)
+        v = torch.randint(num_nodes, (batch,), generator=generator)
+        cross = labels[u] != labels[v]
+        u, v = u[cross], v[cross]
+        take = min(remaining, u.numel())
+        if take > 0:
+            collected_u.append(u[:take])
+            collected_v.append(v[:take])
+            remaining -= take
+        attempts += 1
+
+    if not collected_u:
+        return data
+
+    u = torch.cat(collected_u)
+    v = torch.cat(collected_v)
+    rels = target_relations[torch.randint(len(target_relations), (u.numel(),), generator=generator)]
+
+    new_edge_index = torch.cat([edge_index, torch.stack([u, v], dim=0)], dim=1)
+    new_edge_type = torch.cat([edge_type, rels])
+    new_edge_weight = torch.cat([edge_weight, torch.ones(u.numel(), dtype=edge_weight.dtype)])
+
+    return GraphData(
+        x=data.x,
+        edge_index=new_edge_index,
+        edge_type=new_edge_type,
+        edge_weight=new_edge_weight,
+        y_bot=data.y_bot,
+        y_stance=data.y_stance,
+    )
+
+
 def label_distribution(y: torch.Tensor) -> Dict[int, int]:
     values, counts = torch.unique(y.cpu(), return_counts=True)
     return {int(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}

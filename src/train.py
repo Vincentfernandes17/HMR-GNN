@@ -17,6 +17,7 @@ from baselines import (
 from config import Config
 from data import (
     GraphData,
+    apply_edge_attack,
     label_distribution,
     load_mgtab,
     make_splits,
@@ -133,6 +134,8 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     raw_data = load_mgtab(cfg.data_dir)
     y_cpu, label_mapping = select_task_labels(raw_data, cfg.task)
+    if getattr(cfg, "attack_fraction", 0.0):
+        raw_data = apply_edge_attack(raw_data, y_cpu, cfg.attack_fraction, cfg.attack_seed)
     num_classes = int(torch.unique(y_cpu).numel())
     num_relations = int(raw_data.edge_type.max().item()) + 1
     masks_cpu = make_splits(y_cpu, cfg.seed, cfg.train_ratio, cfg.val_ratio)

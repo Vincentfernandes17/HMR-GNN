@@ -38,3 +38,8 @@ class Config:
     seeds: Optional[List[int]] = None
     tune_trials: int = 12
     tune_seed: int = 2026
+
+    # Adversarial relation-camouflage attack: fraction of extra cross-class
+    # (fake<->genuine) edges injected into the graph relative to |E|. 0 = clean.
+    attack_fraction: float = 0.0
+    attack_seed: int = 12345
