@@ -9,19 +9,21 @@ class Config:
     output_dir: str = "./results"
 
     hidden_dim: int = 128
-    rel_dim: int = 32
+    rel_dim: int = 128
     num_layers: int = 2
     num_heads: int = 1
-    dropout: float = 0.3
+    dropout: float = 0.5
 
     lr: float = 1e-3
     weight_decay: float = 5e-4
-    epochs: int = 100
-    patience: int = 25
+    epochs: int = 500
+    patience: int = 50
     batch_size: int = 0  # 0 means full-batch graph training.
 
-    train_ratio: float = 0.7
-    val_ratio: float = 0.1
+    early_stop_monitor: str = "val_loss"  # "val_loss" or "val_f1"
+
+    train_ratio: float = 0.6
+    val_ratio: float = 0.2
 
     use_class_weights: bool = True
     class_weight_power: float = 1.0

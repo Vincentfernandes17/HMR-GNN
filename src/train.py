@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from baselines import (
     DirectionalRGCNBaseline,
+    GATBaseline,
     GCNBaseline,
     GraphSAGEBaseline,
     MLPBaseline,
@@ -66,6 +67,9 @@ def build_model(model_name, cfg, in_dim, num_classes, num_relations):
         return GCNBaseline(in_dim, cfg.hidden_dim, num_classes, cfg.num_layers, cfg.dropout)
     if model_name == "graphsage":
         return GraphSAGEBaseline(in_dim, cfg.hidden_dim, num_classes, cfg.num_layers, cfg.dropout)
+    if model_name == "gat":
+        heads = cfg.num_heads if cfg.num_heads > 1 else 4
+        return GATBaseline(in_dim, cfg.hidden_dim, num_classes, cfg.num_layers, cfg.dropout, num_heads=heads)
     if model_name == "rgcn":
         return RGCNBaseline(in_dim, cfg.hidden_dim, num_classes, num_relations, cfg.num_layers, cfg.dropout)
     if model_name == "dir_rgcn":
@@ -158,6 +162,8 @@ def train(
 
     best_state = None
     best_val_f1 = -1.0
+    best_val_loss = float("inf")
+    best_metric = float("inf") if cfg.early_stop_monitor == "val_loss" else -1.0
     best_epoch = 0
     patience_ctr = 0
     history = []
@@ -205,8 +211,17 @@ def train(
                 f"val_f1={val_f1:.4f}"
             )
 
-        if val_f1 > best_val_f1:
+        if cfg.early_stop_monitor == "val_loss":
+            current_metric = metrics_val["loss"]
+            improved = current_metric < best_metric
+        else:
+            current_metric = val_f1
+            improved = current_metric > best_metric
+
+        if improved:
+            best_metric = current_metric
             best_val_f1 = val_f1
+            best_val_loss = metrics_val["loss"]
             best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             patience_ctr = 0

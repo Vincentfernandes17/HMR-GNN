@@ -6,11 +6,11 @@ from copy import deepcopy
 from dataclasses import asdict
 
 from config import Config
-from reporting import ensure_dir, mean_std, write_json, write_table_bundle
+from reporting import ensure_dir, mean_std, significance_table, write_json, write_table_bundle
 from train import train
 
 
-BASELINE_MODELS = ["mlp", "gcn", "graphsage", "rgcn", "dir_rgcn", "hmr", "hmr_full"]
+BASELINE_MODELS = ["mlp", "gcn", "graphsage", "gat", "rgcn", "dir_rgcn", "hmr", "hmr_full"]
 ABLATION_MODELS = ["hmr", "hmr_homophily", "hmr_directional", "hmr_full"]
 METRIC_KEYS = [
     "accuracy",
@@ -116,6 +116,16 @@ def run_baselines(cfg, seeds, output_dir, verbose):
         "Baseline comparison on MGTAB reported as mean and standard deviation across seeds",
         "tab:baseline-comparison",
     )
+    sig_rows = significance_table(rows, reference_model="hmr_full")
+    if sig_rows:
+        write_table_bundle(
+            os.path.join(table_dir, "significance_tests"),
+            sig_rows,
+            "Paired significance tests of HMR-GNN (full) against each baseline across seeds. "
+            "Primary test is a paired t-test; Wilcoxon signed-rank p-values are reported for "
+            "reference. Significance stars: *** p<0.001, ** p<0.01, * p<0.05, ns not significant.",
+            "tab:significance",
+        )
     return rows, results
 
 
@@ -302,7 +312,7 @@ def parse_args():
     parser.add_argument("--task", choices=["bot", "stance", "both"], default="both")
     parser.add_argument("--data-dir", default="./data/MGTAB")
     parser.add_argument("--output-dir", default="./results")
-    parser.add_argument("--seeds", default="42,52,62")
+    parser.add_argument("--seeds", default="42,52,62,72,82")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--trials", type=int, default=12)
