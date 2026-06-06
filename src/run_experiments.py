@@ -174,12 +174,25 @@ def run_tuning(cfg, output_dir, verbose):
         trial_cfg.output_dir = output_dir
 
         print(f"\n=== TUNING TRIAL {trial_idx}/{cfg.tune_trials}: {params} ===")
-        result = train(trial_cfg, model_name="hmr_full", return_metrics=True, verbose=verbose)
+        try:
+            result = train(trial_cfg, model_name="hmr_full", return_metrics=True, verbose=verbose)
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(f"[skip] trial {trial_idx} ran out of memory, skipping: {params}")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            raise
         results.append(result)
         row = {"trial": trial_idx}
         row.update(params)
         row.update(_metric_row(result))
         rows.append(row)
+
+    if not rows:
+        print("[warn] no tuning trials succeeded; skipping tuning tables")
+        return rows, results, None
 
     best = max(rows, key=lambda row: row["f1_macro"])
     write_table_bundle(
@@ -248,12 +261,14 @@ def _run_task(args, task):
             rows, results = run_baselines(cfg, seeds, args.output_dir, verbose)
             task_rows.extend(rows)
             task_results.extend(results)
-        if args.mode in {"tune", "all"}:
-            rows, results, _ = run_tuning(cfg, args.output_dir, verbose)
-            task_rows.extend(rows)
-            task_results.extend(results)
+        # Ablation runs before tuning: it is cheaper and more essential to the paper,
+        # so it should complete even if the (heavier, large-config) tuning struggles.
         if args.mode in {"ablation", "all"}:
             rows, results = run_ablation(cfg, seeds, args.output_dir, verbose)
+            task_rows.extend(rows)
+            task_results.extend(results)
+        if args.mode in {"tune", "all"}:
+            rows, results, _ = run_tuning(cfg, args.output_dir, verbose)
             task_rows.extend(rows)
             task_results.extend(results)
 

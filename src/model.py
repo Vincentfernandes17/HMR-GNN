@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 class HeterophilyRelationalLayer(nn.Module):
     def __init__(
@@ -189,6 +190,11 @@ class HMRGNN(nn.Module):
     ):
         super().__init__()
         self.log_gate_scores = log_gate_scores
+        # Gradient checkpointing trades a little compute for much lower peak memory by
+        # recomputing each layer during backprop instead of storing its activations.
+        # This keeps full-batch training on the 1.7M-edge graph within GPU memory even
+        # for large hyperparameter-search configs (e.g. hidden_dim=256, num_layers=3).
+        self.use_checkpoint = True
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -221,7 +227,13 @@ class HMRGNN(nn.Module):
     def forward(self, x, edge_index, edge_type, edge_weight=None, relation_homophily=None):
         h = self.input_proj(x)
         for layer in self.layers:
-            h = layer(h, edge_index, edge_type, edge_weight, relation_homophily)
+            if self.use_checkpoint and self.training:
+                h = checkpoint(
+                    layer, h, edge_index, edge_type, edge_weight, relation_homophily,
+                    use_reentrant=False,
+                )
+            else:
+                h = layer(h, edge_index, edge_type, edge_weight, relation_homophily)
         return self.classifier(h)
 
     def gate_statistics(self):
