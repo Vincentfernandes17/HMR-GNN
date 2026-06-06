@@ -1,4 +1,8 @@
-﻿data/
+﻿data/*
+!data/MGTAB/
+data/MGTAB/*
+!data/MGTAB/*.pt
 __pycache__/
 .venv/
 *.pyc
+results/
