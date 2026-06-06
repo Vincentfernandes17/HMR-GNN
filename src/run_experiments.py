@@ -1,9 +1,12 @@
 import argparse
+import gc
 import itertools
 import os
 import random
 from copy import deepcopy
 from dataclasses import asdict
+
+import torch
 
 from config import Config
 from reporting import ensure_dir, mean_std, significance_table, write_json, write_table_bundle
@@ -98,6 +101,9 @@ def _run_many(cfg, models, seeds, output_dir, verbose):
             result = train(run_cfg, model_name=model_name, return_metrics=True, verbose=verbose)
             results.append(result)
             rows.append(_metric_row(result))
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     return rows, results
 
 

@@ -39,29 +39,29 @@ class HeterophilyRelationalLayer(nn.Module):
 
         self.rel_emb = nn.Embedding(num_relations, rel_dim)
 
-        gate_in_dim = hidden_dim * 2 + rel_dim + (1 if use_homophily_gate else 0)
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(gate_in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        # Memory-efficient factorized gate. This is algebraically equivalent to a
+        # Linear layer applied to [h_src || h_dst || rel_emb (|| homophily)], but it
+        # never materializes that wide per-edge concatenation. Each term is a
+        # separate projection, and the relation/homophily terms are computed once
+        # per relation (broadcast over edges) instead of once per edge.
+        self.gate_src = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.gate_dst = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.gate_rel = nn.Linear(rel_dim, hidden_dim, bias=False)
+        self.gate_hom = nn.Linear(1, hidden_dim, bias=False) if use_homophily_gate else None
+        self.gate_out = nn.Linear(hidden_dim, 1)
 
         self.rel_attn = nn.Linear(hidden_dim, self.num_heads)
         self.skip = nn.Linear(hidden_dim, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def _gate(self, h_source, h_target, rel_vec, homophily_value):
-        parts = [h_source, h_target, rel_vec]
+    def _gate(self, h_source, h_target, rel_emb_vec, homophily_value):
+        # rel_emb_vec is a single relation embedding of shape [rel_dim]; its
+        # projection is a [hidden_dim] vector that broadcasts over all edges.
+        pre = self.gate_src(h_source) + self.gate_dst(h_target) + self.gate_rel(rel_emb_vec)
         if self.use_homophily_gate:
-            hom = torch.full(
-                (h_source.size(0), 1),
-                float(homophily_value),
-                device=h_source.device,
-                dtype=h_source.dtype,
-            )
-            parts.append(hom)
-
-        gate_logits = self.gate_mlp(torch.cat(parts, dim=-1))
+            hom = h_source.new_tensor([[float(homophily_value)]])  # [1, 1]
+            pre = pre + self.gate_hom(hom)  # [1, hidden_dim] broadcast over edges
+        gate_logits = self.gate_out(F.relu(pre))
         if self.use_homophily_gate:
             heterophily_bonus = self.homophily_alpha * (1.0 - float(homophily_value))
             gate_logits = gate_logits + heterophily_bonus
@@ -109,9 +109,9 @@ class HeterophilyRelationalLayer(nn.Module):
 
                 h_s = x[s]
                 h_d = x[d]
-                rel_vec = self.rel_emb.weight[r].unsqueeze(0).expand(h_s.size(0), -1)
+                rel_emb_vec = self.rel_emb.weight[r]
 
-                gate = self._gate(h_s, h_d, rel_vec, relation_homophily[r])
+                gate = self._gate(h_s, h_d, rel_emb_vec, relation_homophily[r])
                 self._collect_gate_stats(r, "in", gate)
 
                 msg = self.rel_linears[r](h_s) * gate * edge_weight[mask].unsqueeze(-1)
@@ -121,7 +121,7 @@ class HeterophilyRelationalLayer(nn.Module):
                 out_r = out_r / deg.unsqueeze(-1)
 
                 if self.separate_directions:
-                    gate_rev = self._gate(h_d, h_s, rel_vec, relation_homophily[r])
+                    gate_rev = self._gate(h_d, h_s, rel_emb_vec, relation_homophily[r])
                     self._collect_gate_stats(r, "out", gate_rev)
                     msg_rev = self.rel_linears_out[r](h_d) * gate_rev * edge_weight[mask].unsqueeze(-1)
                     out_rev_r.index_add_(0, s, msg_rev)
