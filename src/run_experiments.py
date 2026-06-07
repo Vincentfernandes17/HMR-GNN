@@ -236,14 +236,14 @@ def run_attack(cfg, seeds, fractions, output_dir, verbose):
     write_table_bundle(
         os.path.join(table_dir, "attack_robustness"),
         agg,
-        "Robustness under adversarial relation-camouflage edge injection "
-        "(accuracy and macro F1, mean over seeds, by attack intensity)",
+        "Robustness to injected adversarial/spurious edges (label-independent random "
+        "edges; accuracy and macro F1, mean over seeds, by injection intensity)",
         "tab:attack-robustness",
     )
     write_table_bundle(
         os.path.join(table_dir, "attack_degradation"),
         _attack_degradation(agg),
-        "Macro F1 degradation under adversarial edge injection relative to the clean "
+        "Macro F1 degradation under injected spurious edges relative to the clean "
         "graph; smaller relative drop indicates greater robustness",
         "tab:attack-degradation",
     )

@@ -137,14 +137,26 @@ def apply_edge_attack(
     fraction: float,
     seed: int,
     target_relations=None,
+    attack_type: str = "random",
 ) -> GraphData:
-    """Simulate relation camouflage by injecting cross-class (fake<->genuine) edges.
+    """Inject adversarial/spurious edges to test structural robustness.
 
-    Adversaries deliberately connect fake accounts to genuine users so that
-    neighborhood aggregation mixes the two classes. We add `fraction * |E|` extra
-    directed edges, each linking two nodes of *different* classes, with relation
-    types drawn from `target_relations` (default: all relations). Node features,
-    labels, and splits are untouched; only the graph structure is perturbed.
+    We add `fraction * |E|` extra directed edges with relation types drawn from
+    `target_relations` (default: all relations). Node features, labels, and splits
+    are untouched; only the graph structure is perturbed.
+
+    attack_type:
+      - "random" (default): edges between uniformly random node pairs, INDEPENDENT
+        of labels. This simulates spurious/noisy adversarial edges (e.g. link
+        farming, spam follows) and is the leakage-free setting used for evaluation:
+        because the perturbation carries no label information, it cannot leak labels
+        into a transductive model, and it directly stresses the edge-gating
+        mechanism's ability to suppress uninformative edges.
+      - "camouflage": edges between *different* classes. WARNING: in a transductive
+        single-graph setting this LEAKS labels (cross-class-only edges plus training
+        labels let message passing recover test labels via label propagation, giving
+        spuriously near-perfect accuracy). Kept only for analysis/illustration; do
+        NOT use it for robustness claims.
     """
     if not fraction or fraction <= 0:
         return data
@@ -165,28 +177,34 @@ def apply_edge_attack(
         target_relations = list(range(num_relations))
     target_relations = torch.tensor(target_relations, dtype=torch.long)
 
-    # Sample cross-class node pairs by oversampling and rejecting same-class draws.
-    collected_u, collected_v = [], []
-    remaining = n_inject
-    attempts = 0
-    while remaining > 0 and attempts < 200:
-        batch = max(remaining * 2, 1024)
-        u = torch.randint(num_nodes, (batch,), generator=generator)
-        v = torch.randint(num_nodes, (batch,), generator=generator)
-        cross = labels[u] != labels[v]
-        u, v = u[cross], v[cross]
-        take = min(remaining, u.numel())
-        if take > 0:
-            collected_u.append(u[:take])
-            collected_v.append(v[:take])
-            remaining -= take
-        attempts += 1
+    if attack_type == "camouflage":
+        # Cross-class edges (LEAKS labels in transductive settings; not for eval).
+        collected_u, collected_v = [], []
+        remaining = n_inject
+        attempts = 0
+        while remaining > 0 and attempts < 200:
+            batch = max(remaining * 2, 1024)
+            cu = torch.randint(num_nodes, (batch,), generator=generator)
+            cv = torch.randint(num_nodes, (batch,), generator=generator)
+            cross = labels[cu] != labels[cv]
+            cu, cv = cu[cross], cv[cross]
+            take = min(remaining, cu.numel())
+            if take > 0:
+                collected_u.append(cu[:take])
+                collected_v.append(cv[:take])
+                remaining -= take
+            attempts += 1
+        if not collected_u:
+            return data
+        u = torch.cat(collected_u)
+        v = torch.cat(collected_v)
+    else:
+        # Leakage-free: uniformly random node pairs, independent of labels.
+        u = torch.randint(num_nodes, (n_inject,), generator=generator)
+        v = torch.randint(num_nodes, (n_inject,), generator=generator)
+        keep = u != v  # drop self-loops
+        u, v = u[keep], v[keep]
 
-    if not collected_u:
-        return data
-
-    u = torch.cat(collected_u)
-    v = torch.cat(collected_v)
     rels = target_relations[torch.randint(len(target_relations), (u.numel(),), generator=generator)]
 
     new_edge_index = torch.cat([edge_index, torch.stack([u, v], dim=0)], dim=1)
